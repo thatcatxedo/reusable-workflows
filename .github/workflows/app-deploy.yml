@@ -19,11 +19,7 @@ on:
         default: ''
       trigger_on:
         required: false
-        type: choice
-        options:
-          - push
-          - merge
-          - both
+        type: string
         default: 'push'
     secrets:
       deploy_key:
