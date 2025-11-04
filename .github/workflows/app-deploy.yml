@@ -85,6 +85,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
+          driver-opts: image=moby/buildkit:latest
 
       - name: Checkout homelab-deployments
         uses: actions/checkout@v4
