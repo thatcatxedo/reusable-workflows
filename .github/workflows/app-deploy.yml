@@ -1,0 +1,157 @@
+name: App Deployment Workflow
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        required: true
+        type: string
+      image_registry:
+        required: true
+        type: string
+      version_source:
+        required: false
+        type: string
+        default: 'config.yaml'
+      kustomize_path:
+        required: false
+        type: string
+        default: ''
+      trigger_on:
+        required: false
+        type: choice
+        options:
+          - push
+          - merge
+          - both
+        default: 'push'
+    secrets:
+      deploy_key:
+        required: true
+      github_token:
+        required: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+
+    steps:
+      - name: Checkout app code
+        uses: actions/checkout@v4
+
+      - name: Get short SHA
+        id: sha
+        run: echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Install Python dependencies
+        run: |
+          pip3 install pyyaml --quiet || true
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION_SOURCE="${{ inputs.version_source }}"
+          
+          if [ "$VERSION_SOURCE" = "config.yaml" ]; then
+            VERSION=$(python3 -c "import yaml; print(yaml.safe_load(open('config.yaml'))['app']['version'])")
+          elif [ "$VERSION_SOURCE" = "package.json" ]; then
+            VERSION=$(python3 -c "import json; print(json.load(open('package.json'))['version'])")
+          elif [ -f "$VERSION_SOURCE" ]; then
+            # Try to extract version from file (assumes YAML)
+            VERSION=$(python3 -c "import yaml; print(yaml.safe_load(open('$VERSION_SOURCE'))['version'])")
+          else
+            VERSION=$(git describe --tags --always || echo "dev")
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.github_token }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ inputs.image_registry }}:${{ steps.version.outputs.version }}
+            ${{ inputs.image_registry }}:${{ steps.version.outputs.version }}-${{ steps.sha.outputs.short }}
+            ${{ inputs.image_registry }}:${{ steps.sha.outputs.short }}
+            ${{ inputs.image_registry }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Checkout homelab-deployments
+        uses: actions/checkout@v4
+        with:
+          repository: thatcatxedo/homelab-deployments
+          ssh-key: ${{ secrets.deploy_key }}
+          path: homelab
+
+      - name: Setup Kustomize
+        uses: imranismail/setup-kustomize@v2
+
+      - name: Determine Kustomize path
+        id: kustomize_path
+        run: |
+          if [ -n "${{ inputs.kustomize_path }}" ]; then
+            KUSTOMIZE_PATH="${{ inputs.kustomize_path }}"
+          else
+            KUSTOMIZE_PATH="apps/${{ inputs.app_name }}/overlays/prod"
+          fi
+          echo "path=$KUSTOMIZE_PATH" >> $GITHUB_OUTPUT
+          echo "Kustomize path: $KUSTOMIZE_PATH"
+
+      - name: Update image tag in Kustomize
+        working-directory: homelab
+        run: |
+          cd "${{ steps.kustomize_path.outputs.path }}" || {
+            echo "Error: Kustomize path does not exist: ${{ steps.kustomize_path.outputs.path }}"
+            exit 1
+          }
+          kustomize edit set image ${{ inputs.image_registry }}=${{ inputs.image_registry }}:${{ steps.version.outputs.version }}
+
+      - name: Update version annotation in base deployment
+        working-directory: homelab/apps/${{ inputs.app_name }}/base
+        run: |
+          # Update version annotation using Python
+          python3 <<EOF
+          import yaml
+          import sys
+          
+          version = "${{ steps.version.outputs.version }}"
+          
+          with open('deployment.yaml', 'r') as f:
+              doc = yaml.safe_load(f)
+          
+          if 'annotations' not in doc['spec']['template']['metadata']:
+              doc['spec']['template']['metadata']['annotations'] = {}
+          
+          doc['spec']['template']['metadata']['annotations']['app.kubernetes.io/version'] = version
+          
+          with open('deployment.yaml', 'w') as f:
+              yaml.dump(doc, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+          EOF
+
+      - name: Commit and push changes
+        working-directory: homelab
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add apps/${{ inputs.app_name }}/overlays/prod/kustomization.yaml apps/${{ inputs.app_name }}/base/deployment.yaml
+          git diff --staged --quiet || git commit -m "chore: Update ${{ inputs.app_name }} to ${{ steps.version.outputs.version }} (${{ steps.sha.outputs.short }})"
+          git push
+
+      - name: Output deployment info
+        run: |
+          echo "✅ Deployment updated to version ${{ steps.version.outputs.version }}"
+          echo "ArgoCD will auto-sync within 3 minutes"
